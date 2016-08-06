@@ -15,39 +15,55 @@
  */
 package com.google.android.exoplayer.demo;
 
+import com.google.android.exoplayer.AspectRatioFrameLayout;
+import com.google.android.exoplayer.ExoPlaybackException;
 import com.google.android.exoplayer.ExoPlayer;
-import com.google.android.exoplayer.VideoSurfaceView;
+import com.google.android.exoplayer.MediaCodecTrackRenderer.DecoderInitializationException;
+import com.google.android.exoplayer.MediaCodecUtil.DecoderQueryException;
+import com.google.android.exoplayer.MediaFormat;
+import com.google.android.exoplayer.audio.AudioCapabilities;
+import com.google.android.exoplayer.audio.AudioCapabilitiesReceiver;
 import com.google.android.exoplayer.demo.player.DashRendererBuilder;
-import com.google.android.exoplayer.demo.player.DefaultRendererBuilder;
 import com.google.android.exoplayer.demo.player.DemoPlayer;
 import com.google.android.exoplayer.demo.player.DemoPlayer.RendererBuilder;
+import com.google.android.exoplayer.demo.player.ExtractorRendererBuilder;
 import com.google.android.exoplayer.demo.player.HlsRendererBuilder;
 import com.google.android.exoplayer.demo.player.SmoothStreamingRendererBuilder;
-import com.google.android.exoplayer.demo.player.UnsupportedDrmException;
-import com.google.android.exoplayer.metadata.TxxxMetadata;
+import com.google.android.exoplayer.drm.UnsupportedDrmException;
+import com.google.android.exoplayer.metadata.id3.ApicFrame;
+import com.google.android.exoplayer.metadata.id3.GeobFrame;
+import com.google.android.exoplayer.metadata.id3.Id3Frame;
+import com.google.android.exoplayer.metadata.id3.PrivFrame;
+import com.google.android.exoplayer.metadata.id3.TextInformationFrame;
+import com.google.android.exoplayer.metadata.id3.TxxxFrame;
 import com.google.android.exoplayer.text.CaptionStyleCompat;
-import com.google.android.exoplayer.text.SubtitleView;
+import com.google.android.exoplayer.text.Cue;
+import com.google.android.exoplayer.text.SubtitleLayout;
+import com.google.android.exoplayer.util.DebugTextViewHelper;
+import com.google.android.exoplayer.util.MimeTypes;
 import com.google.android.exoplayer.util.Util;
 import com.google.android.exoplayer.util.VerboseLogUtil;
 
+import android.Manifest.permission;
 import android.annotation.TargetApi;
 import android.app.Activity;
 import android.content.Context;
 import android.content.Intent;
-import android.graphics.Point;
+import android.content.pm.PackageManager;
 import android.net.Uri;
 import android.os.Bundle;
 import android.text.TextUtils;
 import android.util.Log;
-import android.view.Display;
+import android.view.KeyEvent;
 import android.view.Menu;
 import android.view.MenuItem;
 import android.view.MotionEvent;
 import android.view.SurfaceHolder;
+import android.view.SurfaceView;
 import android.view.View;
 import android.view.View.OnClickListener;
+import android.view.View.OnKeyListener;
 import android.view.View.OnTouchListener;
-import android.view.WindowManager;
 import android.view.accessibility.CaptioningManager;
 import android.widget.Button;
 import android.widget.MediaController;
@@ -56,37 +72,53 @@ import android.widget.PopupMenu.OnMenuItemClickListener;
 import android.widget.TextView;
 import android.widget.Toast;
 
-import java.util.Map;
+import java.net.CookieHandler;
+import java.net.CookieManager;
+import java.net.CookiePolicy;
+import java.util.List;
+import java.util.Locale;
 
 /**
  * An activity that plays media using {@link DemoPlayer}.
  */
 public class PlayerActivity extends Activity implements SurfaceHolder.Callback, OnClickListener,
-    DemoPlayer.Listener, DemoPlayer.TextListener, DemoPlayer.Id3MetadataListener {
+    DemoPlayer.Listener, DemoPlayer.CaptionListener, DemoPlayer.Id3MetadataListener,
+    AudioCapabilitiesReceiver.Listener {
 
-  public static final String CONTENT_TYPE_EXTRA = "content_type";
+  // For use within demo app code.
   public static final String CONTENT_ID_EXTRA = "content_id";
+  public static final String CONTENT_TYPE_EXTRA = "content_type";
+  public static final String PROVIDER_EXTRA = "provider";
+
+  // For use when launching the demo app using adb.
+  private static final String CONTENT_EXT_EXTRA = "type";
 
   private static final String TAG = "PlayerActivity";
-
-  private static final float CAPTION_LINE_HEIGHT_RATIO = 0.0533f;
   private static final int MENU_GROUP_TRACKS = 1;
   private static final int ID_OFFSET = 2;
+
+  private static final CookieManager defaultCookieManager;
+  static {
+    defaultCookieManager = new CookieManager();
+    defaultCookieManager.setCookiePolicy(CookiePolicy.ACCEPT_ORIGINAL_SERVER);
+  }
 
   private EventLogger eventLogger;
   private MediaController mediaController;
   private View debugRootView;
   private View shutterView;
-  private VideoSurfaceView surfaceView;
+  private AspectRatioFrameLayout videoFrame;
+  private SurfaceView surfaceView;
   private TextView debugTextView;
   private TextView playerStateTextView;
-  private SubtitleView subtitleView;
+  private SubtitleLayout subtitleLayout;
   private Button videoButton;
   private Button audioButton;
   private Button textButton;
   private Button retryButton;
 
   private DemoPlayer player;
+  private DebugTextViewHelper debugViewHelper;
   private boolean playerNeedsPrepare;
 
   private long playerPosition;
@@ -95,17 +127,15 @@ public class PlayerActivity extends Activity implements SurfaceHolder.Callback, 
   private Uri contentUri;
   private int contentType;
   private String contentId;
+  private String provider;
+
+  private AudioCapabilitiesReceiver audioCapabilitiesReceiver;
 
   // Activity lifecycle
 
   @Override
   public void onCreate(Bundle savedInstanceState) {
     super.onCreate(savedInstanceState);
-
-    Intent intent = getIntent();
-    contentUri = intent.getData();
-    contentType = intent.getIntExtra(CONTENT_TYPE_EXTRA, DemoUtil.TYPE_OTHER);
-    contentId = intent.getStringExtra(CONTENT_ID_EXTRA);
 
     setContentView(R.layout.player_activity);
     View root = findViewById(R.id.root);
@@ -120,18 +150,29 @@ public class PlayerActivity extends Activity implements SurfaceHolder.Callback, 
         return true;
       }
     });
+    root.setOnKeyListener(new OnKeyListener() {
+      @Override
+      public boolean onKey(View v, int keyCode, KeyEvent event) {
+        if (keyCode == KeyEvent.KEYCODE_BACK || keyCode == KeyEvent.KEYCODE_ESCAPE
+            || keyCode == KeyEvent.KEYCODE_MENU) {
+          return false;
+        }
+        return mediaController.dispatchKeyEvent(event);
+      }
+    });
 
     shutterView = findViewById(R.id.shutter);
     debugRootView = findViewById(R.id.controls_root);
 
-    surfaceView = (VideoSurfaceView) findViewById(R.id.surface_view);
+    videoFrame = (AspectRatioFrameLayout) findViewById(R.id.video_frame);
+    surfaceView = (SurfaceView) findViewById(R.id.surface_view);
     surfaceView.getHolder().addCallback(this);
     debugTextView = (TextView) findViewById(R.id.debug_text_view);
 
     playerStateTextView = (TextView) findViewById(R.id.player_state_view);
-    subtitleView = (SubtitleView) findViewById(R.id.subtitles);
+    subtitleLayout = (SubtitleLayout) findViewById(R.id.subtitles);
 
-    mediaController = new MediaController(this);
+    mediaController = new KeyCompatibleMediaController(this);
     mediaController.setAnchorView(root);
     retryButton = (Button) findViewById(R.id.retry_button);
     retryButton.setOnClickListener(this);
@@ -139,16 +180,51 @@ public class PlayerActivity extends Activity implements SurfaceHolder.Callback, 
     audioButton = (Button) findViewById(R.id.audio_controls);
     textButton = (Button) findViewById(R.id.text_controls);
 
-    DemoUtil.setDefaultCookieManager();
+    CookieHandler currentHandler = CookieHandler.getDefault();
+    if (currentHandler != defaultCookieManager) {
+      CookieHandler.setDefault(defaultCookieManager);
+    }
+
+    audioCapabilitiesReceiver = new AudioCapabilitiesReceiver(this, this);
+    audioCapabilitiesReceiver.register();
+  }
+
+  @Override
+  public void onNewIntent(Intent intent) {
+    releasePlayer();
+    playerPosition = 0;
+    setIntent(intent);
+  }
+
+  @Override
+  public void onStart() {
+    super.onStart();
+    if (Util.SDK_INT > 23) {
+      onShown();
+    }
   }
 
   @Override
   public void onResume() {
     super.onResume();
+    if (Util.SDK_INT <= 23 || player == null) {
+      onShown();
+    }
+  }
+
+  private void onShown() {
+    Intent intent = getIntent();
+    contentUri = intent.getData();
+    contentType = intent.getIntExtra(CONTENT_TYPE_EXTRA,
+        inferContentType(contentUri, intent.getStringExtra(CONTENT_EXT_EXTRA)));
+    contentId = intent.getStringExtra(CONTENT_ID_EXTRA);
+    provider = intent.getStringExtra(PROVIDER_EXTRA);
     configureSubtitleView();
     if (player == null) {
-      preparePlayer();
-    } else if (player != null) {
+      if (!maybeRequestPermission()) {
+        preparePlayer(true);
+      }
+    } else {
       player.setBackgrounded(false);
     }
   }
@@ -156,6 +232,20 @@ public class PlayerActivity extends Activity implements SurfaceHolder.Callback, 
   @Override
   public void onPause() {
     super.onPause();
+    if (Util.SDK_INT <= 23) {
+      onHidden();
+    }
+  }
+
+  @Override
+  public void onStop() {
+    super.onStop();
+    if (Util.SDK_INT > 23) {
+      onHidden();
+    }
+  }
+
+  private void onHidden() {
     if (!enableBackgroundAudio) {
       releasePlayer();
     } else {
@@ -167,6 +257,7 @@ public class PlayerActivity extends Activity implements SurfaceHolder.Callback, 
   @Override
   public void onDestroy() {
     super.onDestroy();
+    audioCapabilitiesReceiver.unregister();
     releasePlayer();
   }
 
@@ -175,33 +266,89 @@ public class PlayerActivity extends Activity implements SurfaceHolder.Callback, 
   @Override
   public void onClick(View view) {
     if (view == retryButton) {
-      preparePlayer();
+      preparePlayer(true);
     }
+  }
+
+  // AudioCapabilitiesReceiver.Listener methods
+
+  @Override
+  public void onAudioCapabilitiesChanged(AudioCapabilities audioCapabilities) {
+    if (player == null) {
+      return;
+    }
+    boolean backgrounded = player.getBackgrounded();
+    boolean playWhenReady = player.getPlayWhenReady();
+    releasePlayer();
+    preparePlayer(playWhenReady);
+    player.setBackgrounded(backgrounded);
+  }
+
+  // Permission request listener method
+
+  @Override
+  public void onRequestPermissionsResult(int requestCode, String[] permissions,
+      int[] grantResults) {
+    if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+      preparePlayer(true);
+    } else {
+      Toast.makeText(getApplicationContext(), R.string.storage_permission_denied,
+          Toast.LENGTH_LONG).show();
+      finish();
+    }
+  }
+
+  // Permission management methods
+
+  /**
+   * Checks whether it is necessary to ask for permission to read storage. If necessary, it also
+   * requests permission.
+   *
+   * @return true if a permission request is made. False if it is not necessary.
+   */
+  @TargetApi(23)
+  private boolean maybeRequestPermission() {
+    if (requiresPermission(contentUri)) {
+      requestPermissions(new String[] {permission.READ_EXTERNAL_STORAGE}, 0);
+      return true;
+    } else {
+      return false;
+    }
+  }
+
+  @TargetApi(23)
+  private boolean requiresPermission(Uri uri) {
+    return Util.SDK_INT >= 23
+        && Util.isLocalFileUri(uri)
+        && checkSelfPermission(permission.READ_EXTERNAL_STORAGE)
+            != PackageManager.PERMISSION_GRANTED;
   }
 
   // Internal methods
 
   private RendererBuilder getRendererBuilder() {
-    String userAgent = DemoUtil.getUserAgent(this);
+    String userAgent = Util.getUserAgent(this, "ExoPlayerDemo");
     switch (contentType) {
-      case DemoUtil.TYPE_SS:
-        return new SmoothStreamingRendererBuilder(userAgent, contentUri.toString(), contentId,
-            new SmoothStreamingTestMediaDrmCallback(), debugTextView);
-      case DemoUtil.TYPE_DASH:
-        return new DashRendererBuilder(userAgent, contentUri.toString(), contentId,
-            new WidevineTestMediaDrmCallback(contentId), debugTextView);
-      case DemoUtil.TYPE_HLS:
-        return new HlsRendererBuilder(userAgent, contentUri.toString(), contentId);
+      case Util.TYPE_SS:
+        return new SmoothStreamingRendererBuilder(this, userAgent, contentUri.toString(),
+            new SmoothStreamingTestMediaDrmCallback());
+      case Util.TYPE_DASH:
+        return new DashRendererBuilder(this, userAgent, contentUri.toString(),
+            new WidevineTestMediaDrmCallback(contentId, provider));
+      case Util.TYPE_HLS:
+        return new HlsRendererBuilder(this, userAgent, contentUri.toString());
+      case Util.TYPE_OTHER:
+        return new ExtractorRendererBuilder(this, userAgent, contentUri);
       default:
-        return new DefaultRendererBuilder(this, contentUri, debugTextView);
+        throw new IllegalStateException("Unsupported type: " + contentType);
     }
   }
 
-  private void preparePlayer() {
+  private void preparePlayer(boolean playWhenReady) {
     if (player == null) {
       player = new DemoPlayer(getRendererBuilder());
       player.addListener(this);
-      player.setTextListener(this);
+      player.setCaptionListener(this);
       player.setMetadataListener(this);
       player.seekTo(playerPosition);
       playerNeedsPrepare = true;
@@ -212,6 +359,8 @@ public class PlayerActivity extends Activity implements SurfaceHolder.Callback, 
       player.addListener(eventLogger);
       player.setInfoListener(eventLogger);
       player.setInternalErrorListener(eventLogger);
+      debugViewHelper = new DebugTextViewHelper(player, debugTextView);
+      debugViewHelper.start();
     }
     if (playerNeedsPrepare) {
       player.prepare();
@@ -219,11 +368,13 @@ public class PlayerActivity extends Activity implements SurfaceHolder.Callback, 
       updateButtonVisibilities();
     }
     player.setSurface(surfaceView.getHolder().getSurface());
-    player.setPlayWhenReady(true);
+    player.setPlayWhenReady(playWhenReady);
   }
 
   private void releasePlayer() {
     if (player != null) {
+      debugViewHelper.stop();
+      debugViewHelper = null;
       playerPosition = player.getCurrentPosition();
       player.release();
       player = null;
@@ -266,15 +417,35 @@ public class PlayerActivity extends Activity implements SurfaceHolder.Callback, 
 
   @Override
   public void onError(Exception e) {
+    String errorString = null;
     if (e instanceof UnsupportedDrmException) {
       // Special case DRM failures.
       UnsupportedDrmException unsupportedDrmException = (UnsupportedDrmException) e;
-      int stringId = unsupportedDrmException.reason == UnsupportedDrmException.REASON_NO_DRM
-          ? R.string.drm_error_not_supported
+      errorString = getString(Util.SDK_INT < 18 ? R.string.error_drm_not_supported
           : unsupportedDrmException.reason == UnsupportedDrmException.REASON_UNSUPPORTED_SCHEME
-          ? R.string.drm_error_unsupported_scheme
-          : R.string.drm_error_unknown;
-      Toast.makeText(getApplicationContext(), stringId, Toast.LENGTH_LONG).show();
+          ? R.string.error_drm_unsupported_scheme : R.string.error_drm_unknown);
+    } else if (e instanceof ExoPlaybackException
+        && e.getCause() instanceof DecoderInitializationException) {
+      // Special case for decoder initialization failures.
+      DecoderInitializationException decoderInitializationException =
+          (DecoderInitializationException) e.getCause();
+      if (decoderInitializationException.decoderName == null) {
+        if (decoderInitializationException.getCause() instanceof DecoderQueryException) {
+          errorString = getString(R.string.error_querying_decoders);
+        } else if (decoderInitializationException.secureDecoderRequired) {
+          errorString = getString(R.string.error_no_secure_decoder,
+              decoderInitializationException.mimeType);
+        } else {
+          errorString = getString(R.string.error_no_decoder,
+              decoderInitializationException.mimeType);
+        }
+      } else {
+        errorString = getString(R.string.error_instantiating_decoder,
+            decoderInitializationException.decoderName);
+      }
+    }
+    if (errorString != null) {
+      Toast.makeText(getApplicationContext(), errorString, Toast.LENGTH_LONG).show();
     }
     playerNeedsPrepare = true;
     updateButtonVisibilities();
@@ -282,9 +453,10 @@ public class PlayerActivity extends Activity implements SurfaceHolder.Callback, 
   }
 
   @Override
-  public void onVideoSizeChanged(int width, int height, float pixelWidthAspectRatio) {
+  public void onVideoSizeChanged(int width, int height, int unappliedRotationDegrees,
+      float pixelWidthAspectRatio) {
     shutterView.setVisibility(View.GONE);
-    surfaceView.setVideoWidthHeightRatio(
+    videoFrame.setAspectRatio(
         height == 0 ? 1 : (width * pixelWidthAspectRatio) / height);
   }
 
@@ -298,7 +470,7 @@ public class PlayerActivity extends Activity implements SurfaceHolder.Callback, 
   }
 
   private boolean haveTracks(int type) {
-    return player != null && player.getTracks(type) != null;
+    return player != null && player.getTrackCount(type) > 0;
   }
 
   public void showVideoPopup(View v) {
@@ -361,8 +533,8 @@ public class PlayerActivity extends Activity implements SurfaceHolder.Callback, 
     if (player == null) {
       return;
     }
-    String[] tracks = player.getTracks(trackType);
-    if (tracks == null) {
+    int trackCount = player.getTrackCount(trackType);
+    if (trackCount == 0) {
       return;
     }
     popup.setOnMenuItemClickListener(new OnMenuItemClickListener() {
@@ -374,24 +546,68 @@ public class PlayerActivity extends Activity implements SurfaceHolder.Callback, 
       }
     });
     Menu menu = popup.getMenu();
-    // ID_OFFSET ensures we avoid clashing with Menu.NONE (which equals 0)
-    menu.add(MENU_GROUP_TRACKS, DemoPlayer.DISABLED_TRACK + ID_OFFSET, Menu.NONE, R.string.off);
-    if (tracks.length == 1 && TextUtils.isEmpty(tracks[0])) {
-      menu.add(MENU_GROUP_TRACKS, DemoPlayer.PRIMARY_TRACK + ID_OFFSET, Menu.NONE, R.string.on);
-    } else {
-      for (int i = 0; i < tracks.length; i++) {
-        menu.add(MENU_GROUP_TRACKS, i + ID_OFFSET, Menu.NONE, tracks[i]);
-      }
+    // ID_OFFSET ensures we avoid clashing with Menu.NONE (which equals 0).
+    menu.add(MENU_GROUP_TRACKS, DemoPlayer.TRACK_DISABLED + ID_OFFSET, Menu.NONE, R.string.off);
+    for (int i = 0; i < trackCount; i++) {
+      menu.add(MENU_GROUP_TRACKS, i + ID_OFFSET, Menu.NONE,
+          buildTrackName(player.getTrackFormat(trackType, i)));
     }
     menu.setGroupCheckable(MENU_GROUP_TRACKS, true, true);
-    menu.findItem(player.getSelectedTrackIndex(trackType) + ID_OFFSET).setChecked(true);
+    menu.findItem(player.getSelectedTrack(trackType) + ID_OFFSET).setChecked(true);
+  }
+
+  private static String buildTrackName(MediaFormat format) {
+    if (format.adaptive) {
+      return "auto";
+    }
+    String trackName;
+    if (MimeTypes.isVideo(format.mimeType)) {
+      trackName = joinWithSeparator(joinWithSeparator(buildResolutionString(format),
+          buildBitrateString(format)), buildTrackIdString(format));
+    } else if (MimeTypes.isAudio(format.mimeType)) {
+      trackName = joinWithSeparator(joinWithSeparator(joinWithSeparator(buildLanguageString(format),
+          buildAudioPropertyString(format)), buildBitrateString(format)),
+          buildTrackIdString(format));
+    } else {
+      trackName = joinWithSeparator(joinWithSeparator(buildLanguageString(format),
+          buildBitrateString(format)), buildTrackIdString(format));
+    }
+    return trackName.length() == 0 ? "unknown" : trackName;
+  }
+
+  private static String buildResolutionString(MediaFormat format) {
+    return format.width == MediaFormat.NO_VALUE || format.height == MediaFormat.NO_VALUE
+        ? "" : format.width + "x" + format.height;
+  }
+
+  private static String buildAudioPropertyString(MediaFormat format) {
+    return format.channelCount == MediaFormat.NO_VALUE || format.sampleRate == MediaFormat.NO_VALUE
+        ? "" : format.channelCount + "ch, " + format.sampleRate + "Hz";
+  }
+
+  private static String buildLanguageString(MediaFormat format) {
+    return TextUtils.isEmpty(format.language) || "und".equals(format.language) ? ""
+        : format.language;
+  }
+
+  private static String buildBitrateString(MediaFormat format) {
+    return format.bitrate == MediaFormat.NO_VALUE ? ""
+        : String.format(Locale.US, "%.2fMbit", format.bitrate / 1000000f);
+  }
+
+  private static String joinWithSeparator(String first, String second) {
+    return first.length() == 0 ? second : (second.length() == 0 ? first : first + ", " + second);
+  }
+
+  private static String buildTrackIdString(MediaFormat format) {
+    return format.trackId == null ? "" : " (" + format.trackId + ")";
   }
 
   private boolean onTrackItemClick(MenuItem item, int type) {
     if (player == null || item.getGroupId() != MENU_GROUP_TRACKS) {
       return false;
     }
-    player.selectTrack(type, item.getItemId() - ID_OFFSET);
+    player.setSelectedTrack(type, item.getItemId() - ID_OFFSET);
     return true;
   }
 
@@ -409,27 +625,39 @@ public class PlayerActivity extends Activity implements SurfaceHolder.Callback, 
     debugRootView.setVisibility(View.VISIBLE);
   }
 
-  // DemoPlayer.TextListener implementation
+  // DemoPlayer.CaptionListener implementation
 
   @Override
-  public void onText(String text) {
-    if (TextUtils.isEmpty(text)) {
-      subtitleView.setVisibility(View.INVISIBLE);
-    } else {
-      subtitleView.setVisibility(View.VISIBLE);
-      subtitleView.setText(text);
-    }
+  public void onCues(List<Cue> cues) {
+    subtitleLayout.setCues(cues);
   }
 
   // DemoPlayer.MetadataListener implementation
 
   @Override
-  public void onId3Metadata(Map<String, Object> metadata) {
-    for (int i = 0; i < metadata.size(); i++) {
-      if (metadata.containsKey(TxxxMetadata.TYPE)) {
-        TxxxMetadata txxxMetadata = (TxxxMetadata) metadata.get(TxxxMetadata.TYPE);
-        Log.i(TAG, String.format("ID3 TimedMetadata: description=%s, value=%s",
-            txxxMetadata.description, txxxMetadata.value));
+  public void onId3Metadata(List<Id3Frame> id3Frames) {
+    for (Id3Frame id3Frame : id3Frames) {
+      if (id3Frame instanceof TxxxFrame) {
+        TxxxFrame txxxFrame = (TxxxFrame) id3Frame;
+        Log.i(TAG, String.format("ID3 TimedMetadata %s: description=%s, value=%s", txxxFrame.id,
+            txxxFrame.description, txxxFrame.value));
+      } else if (id3Frame instanceof PrivFrame) {
+        PrivFrame privFrame = (PrivFrame) id3Frame;
+        Log.i(TAG, String.format("ID3 TimedMetadata %s: owner=%s", privFrame.id, privFrame.owner));
+      } else if (id3Frame instanceof GeobFrame) {
+        GeobFrame geobFrame = (GeobFrame) id3Frame;
+        Log.i(TAG, String.format("ID3 TimedMetadata %s: mimeType=%s, filename=%s, description=%s",
+            geobFrame.id, geobFrame.mimeType, geobFrame.filename, geobFrame.description));
+      } else if (id3Frame instanceof ApicFrame) {
+        ApicFrame apicFrame = (ApicFrame) id3Frame;
+        Log.i(TAG, String.format("ID3 TimedMetadata %s: mimeType=%s, description=%s",
+                apicFrame.id, apicFrame.mimeType, apicFrame.description));
+      } else if (id3Frame instanceof TextInformationFrame) {
+        TextInformationFrame textInformationFrame = (TextInformationFrame) id3Frame;
+        Log.i(TAG, String.format("ID3 TimedMetadata %s: description=%s", textInformationFrame.id,
+            textInformationFrame.description));
+      } else {
+        Log.i(TAG, String.format("ID3 TimedMetadata %s", id3Frame.id));
       }
     }
   }
@@ -456,25 +684,17 @@ public class PlayerActivity extends Activity implements SurfaceHolder.Callback, 
   }
 
   private void configureSubtitleView() {
-    CaptionStyleCompat captionStyle;
-    float captionTextSize = getCaptionFontSize();
+    CaptionStyleCompat style;
+    float fontScale;
     if (Util.SDK_INT >= 19) {
-      captionStyle = getUserCaptionStyleV19();
-      captionTextSize *= getUserCaptionFontScaleV19();
+      style = getUserCaptionStyleV19();
+      fontScale = getUserCaptionFontScaleV19();
     } else {
-      captionStyle = CaptionStyleCompat.DEFAULT;
+      style = CaptionStyleCompat.DEFAULT;
+      fontScale = 1.0f;
     }
-    subtitleView.setStyle(captionStyle);
-    subtitleView.setTextSize(captionTextSize);
-  }
-
-  private float getCaptionFontSize() {
-    Display display = ((WindowManager) getSystemService(Context.WINDOW_SERVICE))
-        .getDefaultDisplay();
-    Point displaySize = new Point();
-    display.getSize(displaySize);
-    return Math.max(getResources().getDimension(R.dimen.subtitle_minimum_font_size),
-        CAPTION_LINE_HEIGHT_RATIO * Math.min(displaySize.x, displaySize.y));
+    subtitleLayout.setStyle(style);
+    subtitleLayout.setFractionalTextSize(SubtitleLayout.DEFAULT_TEXT_SIZE_FRACTION * fontScale);
   }
 
   @TargetApi(19)
@@ -489,6 +709,56 @@ public class PlayerActivity extends Activity implements SurfaceHolder.Callback, 
     CaptioningManager captioningManager =
         (CaptioningManager) getSystemService(Context.CAPTIONING_SERVICE);
     return CaptionStyleCompat.createFromCaptionStyle(captioningManager.getUserStyle());
+  }
+
+  /**
+   * Makes a best guess to infer the type from a media {@link Uri} and an optional overriding file
+   * extension.
+   *
+   * @param uri The {@link Uri} of the media.
+   * @param fileExtension An overriding file extension.
+   * @return The inferred type.
+   */
+  private static int inferContentType(Uri uri, String fileExtension) {
+    String lastPathSegment = !TextUtils.isEmpty(fileExtension) ? "." + fileExtension
+        : uri.getLastPathSegment();
+    return Util.inferContentType(lastPathSegment);
+  }
+
+  private static final class KeyCompatibleMediaController extends MediaController {
+
+    private MediaController.MediaPlayerControl playerControl;
+
+    public KeyCompatibleMediaController(Context context) {
+      super(context);
+    }
+
+    @Override
+    public void setMediaPlayer(MediaController.MediaPlayerControl playerControl) {
+      super.setMediaPlayer(playerControl);
+      this.playerControl = playerControl;
+    }
+
+    @Override
+    public boolean dispatchKeyEvent(KeyEvent event) {
+      int keyCode = event.getKeyCode();
+      if (playerControl.canSeekForward() && (keyCode == KeyEvent.KEYCODE_MEDIA_FAST_FORWARD
+          || keyCode == KeyEvent.KEYCODE_DPAD_RIGHT)) {
+        if (event.getAction() == KeyEvent.ACTION_DOWN) {
+          playerControl.seekTo(playerControl.getCurrentPosition() + 15000); // milliseconds
+          show();
+        }
+        return true;
+      } else if (playerControl.canSeekBackward() && (keyCode == KeyEvent.KEYCODE_MEDIA_REWIND
+          || keyCode == KeyEvent.KEYCODE_DPAD_LEFT)) {
+        if (event.getAction() == KeyEvent.ACTION_DOWN) {
+          playerControl.seekTo(playerControl.getCurrentPosition() - 5000); // milliseconds
+          show();
+        }
+        return true;
+      }
+      return super.dispatchKeyEvent(event);
+    }
   }
 
 }

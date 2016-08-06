@@ -15,15 +15,19 @@
  */
 package com.google.android.exoplayer;
 
+import com.google.android.exoplayer.MediaCodecUtil.DecoderQueryException;
+import com.google.android.exoplayer.audio.AudioCapabilities;
 import com.google.android.exoplayer.audio.AudioTrack;
 import com.google.android.exoplayer.drm.DrmSessionManager;
 import com.google.android.exoplayer.util.MimeTypes;
 
 import android.annotation.TargetApi;
+import android.media.AudioManager;
 import android.media.MediaCodec;
-import android.media.MediaFormat;
+import android.media.PlaybackParams;
 import android.media.audiofx.Virtualizer;
 import android.os.Handler;
+import android.os.SystemClock;
 
 import java.nio.ByteBuffer;
 
@@ -31,7 +35,7 @@ import java.nio.ByteBuffer;
  * Decodes and renders audio using {@link MediaCodec} and {@link android.media.AudioTrack}.
  */
 @TargetApi(16)
-public class MediaCodecAudioTrackRenderer extends MediaCodecTrackRenderer {
+public class MediaCodecAudioTrackRenderer extends MediaCodecTrackRenderer implements MediaClock {
 
   /**
    * Interface definition for a callback to be notified of {@link MediaCodecAudioTrackRenderer}
@@ -53,6 +57,17 @@ public class MediaCodecAudioTrackRenderer extends MediaCodecTrackRenderer {
      */
     void onAudioTrackWriteError(AudioTrack.WriteException e);
 
+    /**
+     * Invoked when an {@link AudioTrack} underrun occurs.
+     *
+     * @param bufferSize The size of the {@link AudioTrack}'s buffer, in bytes.
+     * @param bufferSizeMs The size of the {@link AudioTrack}'s buffer, in milliseconds, if it is
+     *     configured for PCM output. -1 if it is configured for passthrough output, as the buffered
+     *     media can have a variable bitrate so the duration may be unknown.
+     * @param elapsedSinceLastFeedMs The time since the {@link AudioTrack} was last fed data.
+     */
+    void onAudioTrackUnderrun(int bufferSize, long bufferSizeMs, long elapsedSinceLastFeedMs);
+
   }
 
   /**
@@ -62,85 +77,213 @@ public class MediaCodecAudioTrackRenderer extends MediaCodecTrackRenderer {
    */
   public static final int MSG_SET_VOLUME = 1;
 
+  /**
+   * The type of a message that can be passed to an instance of this class via
+   * {@link ExoPlayer#sendMessage} or {@link ExoPlayer#blockingSendMessage}. The message object
+   * should be a {@link android.media.PlaybackParams}, which will be used to configure the
+   * underlying {@link android.media.AudioTrack}. The message object should not be modified by the
+   * caller after it has been passed
+   */
+  public static final int MSG_SET_PLAYBACK_PARAMS = 2;
+
   private final EventListener eventListener;
   private final AudioTrack audioTrack;
 
+  private boolean passthroughEnabled;
+  private android.media.MediaFormat passthroughMediaFormat;
+  private int pcmEncoding;
   private int audioSessionId;
   private long currentPositionUs;
+  private boolean allowPositionDiscontinuity;
+
+  private boolean audioTrackHasData;
+  private long lastFeedElapsedRealtimeMs;
 
   /**
    * @param source The upstream source from which the renderer obtains samples.
+   * @param mediaCodecSelector A decoder selector.
    */
-  public MediaCodecAudioTrackRenderer(SampleSource source) {
-    this(source, null, true);
+  public MediaCodecAudioTrackRenderer(SampleSource source, MediaCodecSelector mediaCodecSelector) {
+    this(source, mediaCodecSelector, null, true);
   }
 
   /**
    * @param source The upstream source from which the renderer obtains samples.
+   * @param mediaCodecSelector A decoder selector.
    * @param drmSessionManager For use with encrypted content. May be null if support for encrypted
    *     content is not required.
    * @param playClearSamplesWithoutKeys Encrypted media may contain clear (un-encrypted) regions.
    *     For example a media file may start with a short clear region so as to allow playback to
-   *     begin in parallel with key acquisision. This parameter specifies whether the renderer is
+   *     begin in parallel with key acquisition. This parameter specifies whether the renderer is
    *     permitted to play clear regions of encrypted media files before {@code drmSessionManager}
    *     has obtained the keys necessary to decrypt encrypted regions of the media.
    */
-  public MediaCodecAudioTrackRenderer(SampleSource source, DrmSessionManager drmSessionManager,
-      boolean playClearSamplesWithoutKeys) {
-    this(source, drmSessionManager, playClearSamplesWithoutKeys, null, null);
+  public MediaCodecAudioTrackRenderer(SampleSource source, MediaCodecSelector mediaCodecSelector,
+      DrmSessionManager drmSessionManager, boolean playClearSamplesWithoutKeys) {
+    this(source, mediaCodecSelector, drmSessionManager, playClearSamplesWithoutKeys, null, null);
   }
 
   /**
    * @param source The upstream source from which the renderer obtains samples.
+   * @param mediaCodecSelector A decoder selector.
    * @param eventHandler A handler to use when delivering events to {@code eventListener}. May be
    *     null if delivery of events is not required.
    * @param eventListener A listener of events. May be null if delivery of events is not required.
    */
-  public MediaCodecAudioTrackRenderer(SampleSource source, Handler eventHandler,
-      EventListener eventListener) {
-    this(source, null, true, eventHandler, eventListener);
+  public MediaCodecAudioTrackRenderer(SampleSource source, MediaCodecSelector mediaCodecSelector,
+      Handler eventHandler, EventListener eventListener) {
+    this(source, mediaCodecSelector, null, true, eventHandler, eventListener);
   }
 
   /**
    * @param source The upstream source from which the renderer obtains samples.
+   * @param mediaCodecSelector A decoder selector.
    * @param drmSessionManager For use with encrypted content. May be null if support for encrypted
    *     content is not required.
    * @param playClearSamplesWithoutKeys Encrypted media may contain clear (un-encrypted) regions.
    *     For example a media file may start with a short clear region so as to allow playback to
-   *     begin in parallel with key acquisision. This parameter specifies whether the renderer is
+   *     begin in parallel with key acquisition. This parameter specifies whether the renderer is
    *     permitted to play clear regions of encrypted media files before {@code drmSessionManager}
    *     has obtained the keys necessary to decrypt encrypted regions of the media.
    * @param eventHandler A handler to use when delivering events to {@code eventListener}. May be
    *     null if delivery of events is not required.
    * @param eventListener A listener of events. May be null if delivery of events is not required.
    */
-  public MediaCodecAudioTrackRenderer(SampleSource source, DrmSessionManager drmSessionManager,
-      boolean playClearSamplesWithoutKeys, Handler eventHandler, EventListener eventListener) {
-    super(source, drmSessionManager, playClearSamplesWithoutKeys, eventHandler, eventListener);
+  public MediaCodecAudioTrackRenderer(SampleSource source, MediaCodecSelector mediaCodecSelector,
+      DrmSessionManager drmSessionManager, boolean playClearSamplesWithoutKeys,
+      Handler eventHandler, EventListener eventListener) {
+    this(source, mediaCodecSelector, drmSessionManager, playClearSamplesWithoutKeys, eventHandler,
+        eventListener, null, AudioManager.STREAM_MUSIC);
+  }
+
+  /**
+   * @param source The upstream source from which the renderer obtains samples.
+   * @param mediaCodecSelector A decoder selector.
+   * @param drmSessionManager For use with encrypted content. May be null if support for encrypted
+   *     content is not required.
+   * @param playClearSamplesWithoutKeys Encrypted media may contain clear (un-encrypted) regions.
+   *     For example a media file may start with a short clear region so as to allow playback to
+   *     begin in parallel with key acquisition. This parameter specifies whether the renderer is
+   *     permitted to play clear regions of encrypted media files before {@code drmSessionManager}
+   *     has obtained the keys necessary to decrypt encrypted regions of the media.
+   * @param eventHandler A handler to use when delivering events to {@code eventListener}. May be
+   *     null if delivery of events is not required.
+   * @param eventListener A listener of events. May be null if delivery of events is not required.
+   * @param audioCapabilities The audio capabilities for playback on this device. May be null if the
+   *     default capabilities (no encoded audio passthrough support) should be assumed.
+   * @param streamType The type of audio stream for the {@link AudioTrack}.
+   */
+  public MediaCodecAudioTrackRenderer(SampleSource source, MediaCodecSelector mediaCodecSelector,
+      DrmSessionManager drmSessionManager, boolean playClearSamplesWithoutKeys,
+      Handler eventHandler, EventListener eventListener, AudioCapabilities audioCapabilities,
+      int streamType) {
+    this (new SampleSource[] {source}, mediaCodecSelector, drmSessionManager,
+        playClearSamplesWithoutKeys, eventHandler, eventListener, audioCapabilities, streamType);
+  }
+
+  /**
+   * @param sources The upstream sources from which the renderer obtains samples.
+   * @param mediaCodecSelector A decoder selector.
+   * @param drmSessionManager For use with encrypted content. May be null if support for encrypted
+   *     content is not required.
+   * @param playClearSamplesWithoutKeys Encrypted media may contain clear (un-encrypted) regions.
+   *     For example a media file may start with a short clear region so as to allow playback to
+   *     begin in parallel with key acquisition. This parameter specifies whether the renderer is
+   *     permitted to play clear regions of encrypted media files before {@code drmSessionManager}
+   *     has obtained the keys necessary to decrypt encrypted regions of the media.
+   * @param eventHandler A handler to use when delivering events to {@code eventListener}. May be
+   *     null if delivery of events is not required.
+   * @param eventListener A listener of events. May be null if delivery of events is not required.
+   * @param audioCapabilities The audio capabilities for playback on this device. May be null if the
+   *     default capabilities (no encoded audio passthrough support) should be assumed.
+   * @param streamType The type of audio stream for the {@link AudioTrack}.
+   */
+  public MediaCodecAudioTrackRenderer(SampleSource[] sources, MediaCodecSelector mediaCodecSelector,
+      DrmSessionManager drmSessionManager, boolean playClearSamplesWithoutKeys,
+      Handler eventHandler, EventListener eventListener, AudioCapabilities audioCapabilities,
+      int streamType) {
+    super(sources, mediaCodecSelector, drmSessionManager, playClearSamplesWithoutKeys, eventHandler,
+        eventListener);
     this.eventListener = eventListener;
     this.audioSessionId = AudioTrack.SESSION_ID_NOT_SET;
-    this.audioTrack = new AudioTrack();
+    this.audioTrack = new AudioTrack(audioCapabilities, streamType);
   }
 
   @Override
-  protected boolean isTimeSource() {
-    return true;
+  protected boolean handlesTrack(MediaCodecSelector mediaCodecSelector, MediaFormat mediaFormat)
+      throws DecoderQueryException {
+    String mimeType = mediaFormat.mimeType;
+    return MimeTypes.isAudio(mimeType) && (MimeTypes.AUDIO_UNKNOWN.equals(mimeType)
+        || (allowPassthrough(mimeType) && mediaCodecSelector.getPassthroughDecoderInfo() != null)
+        || mediaCodecSelector.getDecoderInfo(mimeType, false) != null);
   }
 
   @Override
-  protected boolean handlesMimeType(String mimeType) {
-    return MimeTypes.isAudio(mimeType) && super.handlesMimeType(mimeType);
+  protected DecoderInfo getDecoderInfo(MediaCodecSelector mediaCodecSelector, String mimeType,
+      boolean requiresSecureDecoder) throws DecoderQueryException {
+    if (allowPassthrough(mimeType)) {
+      DecoderInfo passthroughDecoderInfo = mediaCodecSelector.getPassthroughDecoderInfo();
+      if (passthroughDecoderInfo != null) {
+        passthroughEnabled = true;
+        return passthroughDecoderInfo;
+      }
+    }
+    passthroughEnabled = false;
+    return super.getDecoderInfo(mediaCodecSelector, mimeType, requiresSecureDecoder);
+  }
+
+  /**
+   * Returns whether encoded audio passthrough should be used for playing back the input format.
+   * This implementation returns true if the {@link AudioTrack}'s audio capabilities indicate that
+   * passthrough is supported.
+   *
+   * @param mimeType The type of input media.
+   * @return True if passthrough playback should be used. False otherwise.
+   */
+  protected boolean allowPassthrough(String mimeType) {
+    return audioTrack.isPassthroughSupported(mimeType);
   }
 
   @Override
-  protected void onEnabled(long positionUs, boolean joining) {
-    super.onEnabled(positionUs, joining);
-    currentPositionUs = Long.MIN_VALUE;
+  protected void configureCodec(MediaCodec codec, boolean codecIsAdaptive,
+      android.media.MediaFormat format, android.media.MediaCrypto crypto) {
+    String mimeType = format.getString(android.media.MediaFormat.KEY_MIME);
+    if (passthroughEnabled) {
+      // Override the MIME type used to configure the codec if we are using a passthrough decoder.
+      format.setString(android.media.MediaFormat.KEY_MIME, MimeTypes.AUDIO_RAW);
+      codec.configure(format, null, crypto, 0);
+      format.setString(android.media.MediaFormat.KEY_MIME, mimeType);
+      passthroughMediaFormat = format;
+    } else {
+      codec.configure(format, null, crypto, 0);
+      passthroughMediaFormat = null;
+    }
   }
 
   @Override
-  protected void onOutputFormatChanged(MediaFormat format) {
-    audioTrack.reconfigure(format);
+  protected MediaClock getMediaClock() {
+    return this;
+  }
+
+  @Override
+  protected void onInputFormatChanged(MediaFormatHolder holder) throws ExoPlaybackException {
+    super.onInputFormatChanged(holder);
+    // If the input format is anything other than PCM then we assume that the audio decoder will
+    // output 16-bit PCM.
+    pcmEncoding = MimeTypes.AUDIO_RAW.equals(holder.format.mimeType) ? holder.format.pcmEncoding
+        : C.ENCODING_PCM_16BIT;
+  }
+
+  @Override
+  protected void onOutputFormatChanged(MediaCodec codec, android.media.MediaFormat outputFormat) {
+    boolean passthrough = passthroughMediaFormat != null;
+    String mimeType = passthrough
+        ? passthroughMediaFormat.getString(android.media.MediaFormat.KEY_MIME)
+        : MimeTypes.AUDIO_RAW;
+    android.media.MediaFormat format = passthrough ? passthroughMediaFormat : outputFormat;
+    int channelCount = format.getInteger(android.media.MediaFormat.KEY_CHANNEL_COUNT);
+    int sampleRate = format.getInteger(android.media.MediaFormat.KEY_SAMPLE_RATE);
+    audioTrack.configure(mimeType, channelCount, sampleRate, pcmEncoding);
   }
 
   /**
@@ -173,53 +316,53 @@ public class MediaCodecAudioTrackRenderer extends MediaCodecTrackRenderer {
 
   @Override
   protected boolean isEnded() {
-    // We've exhausted the output stream, and the AudioTrack has either played all of the data
-    // submitted, or has been fed insufficient data to begin playback.
-    return super.isEnded() && (!audioTrack.hasPendingData()
-        || !audioTrack.hasEnoughDataToBeginPlayback());
+    return super.isEnded() && !audioTrack.hasPendingData();
   }
 
   @Override
   protected boolean isReady() {
-    return audioTrack.hasPendingData()
-        || (super.isReady() && getSourceState() == SOURCE_STATE_READY_READ_MAY_FAIL);
+    return audioTrack.hasPendingData() || super.isReady();
   }
 
   @Override
-  protected long getCurrentPositionUs() {
-    long audioTrackCurrentPositionUs = audioTrack.getCurrentPositionUs(isEnded());
-    if (audioTrackCurrentPositionUs == AudioTrack.CURRENT_POSITION_NOT_SET) {
-      // Use the super class position before audio playback starts.
-      currentPositionUs = Math.max(currentPositionUs, super.getCurrentPositionUs());
-    } else {
-      // Make sure we don't ever report time moving backwards.
-      currentPositionUs = Math.max(currentPositionUs, audioTrackCurrentPositionUs);
+  public long getPositionUs() {
+    long newCurrentPositionUs = audioTrack.getCurrentPositionUs(isEnded());
+    if (newCurrentPositionUs != AudioTrack.CURRENT_POSITION_NOT_SET) {
+      currentPositionUs = allowPositionDiscontinuity ? newCurrentPositionUs
+          : Math.max(currentPositionUs, newCurrentPositionUs);
+      allowPositionDiscontinuity = false;
     }
     return currentPositionUs;
   }
 
   @Override
-  protected void onDisabled() {
+  protected void onDisabled() throws ExoPlaybackException {
     audioSessionId = AudioTrack.SESSION_ID_NOT_SET;
     try {
-      audioTrack.reset();
+      audioTrack.release();
     } finally {
       super.onDisabled();
     }
   }
 
   @Override
-  protected void seekTo(long positionUs) throws ExoPlaybackException {
-    super.seekTo(positionUs);
-    // TODO: Try and re-use the same AudioTrack instance once [Internal: b/7941810] is fixed.
+  protected void onDiscontinuity(long positionUs) throws ExoPlaybackException {
+    super.onDiscontinuity(positionUs);
     audioTrack.reset();
-    currentPositionUs = Long.MIN_VALUE;
+    currentPositionUs = positionUs;
+    allowPositionDiscontinuity = true;
   }
 
   @Override
   protected boolean processOutputBuffer(long positionUs, long elapsedRealtimeUs, MediaCodec codec,
       ByteBuffer buffer, MediaCodec.BufferInfo bufferInfo, int bufferIndex, boolean shouldSkip)
       throws ExoPlaybackException {
+    if (passthroughEnabled && (bufferInfo.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) {
+      // Discard output buffers from the passthrough (raw) decoder containing codec specific data.
+      codec.releaseOutputBuffer(bufferIndex, false);
+      return true;
+    }
+
     if (shouldSkip) {
       codec.releaseOutputBuffer(bufferIndex, false);
       codecCounters.skippedOutputBufferCount++;
@@ -227,8 +370,8 @@ public class MediaCodecAudioTrackRenderer extends MediaCodecTrackRenderer {
       return true;
     }
 
-    // Initialize and start the audio track now.
     if (!audioTrack.isInitialized()) {
+      // Initialize the AudioTrack now.
       try {
         if (audioSessionId != AudioTrack.SESSION_ID_NOT_SET) {
           audioTrack.initialize(audioSessionId);
@@ -236,13 +379,23 @@ public class MediaCodecAudioTrackRenderer extends MediaCodecTrackRenderer {
           audioSessionId = audioTrack.initialize();
           onAudioSessionId(audioSessionId);
         }
+        audioTrackHasData = false;
       } catch (AudioTrack.InitializationException e) {
         notifyAudioTrackInitializationError(e);
         throw new ExoPlaybackException(e);
       }
-
       if (getState() == TrackRenderer.STATE_STARTED) {
         audioTrack.play();
+      }
+    } else {
+      // Check for AudioTrack underrun.
+      boolean audioTrackHadData = audioTrackHasData;
+      audioTrackHasData = audioTrack.hasPendingData();
+      if (audioTrackHadData && !audioTrackHasData && getState() == TrackRenderer.STATE_STARTED) {
+        long elapsedSinceLastFeedMs = SystemClock.elapsedRealtime() - lastFeedElapsedRealtimeMs;
+        long bufferSizeUs = audioTrack.getBufferSizeUs();
+        long bufferSizeMs = bufferSizeUs == C.UNKNOWN_TIME_US ? -1 : bufferSizeUs / 1000;
+        notifyAudioTrackUnderrun(audioTrack.getBufferSize(), bufferSizeMs, elapsedSinceLastFeedMs);
       }
     }
 
@@ -250,6 +403,7 @@ public class MediaCodecAudioTrackRenderer extends MediaCodecTrackRenderer {
     try {
       handleBufferResult = audioTrack.handleBuffer(
           buffer, bufferInfo.offset, bufferInfo.size, bufferInfo.presentationTimeUs);
+      lastFeedElapsedRealtimeMs = SystemClock.elapsedRealtime();
     } catch (AudioTrack.WriteException e) {
       notifyAudioTrackWriteError(e);
       throw new ExoPlaybackException(e);
@@ -257,7 +411,8 @@ public class MediaCodecAudioTrackRenderer extends MediaCodecTrackRenderer {
 
     // If we are out of sync, allow currentPositionUs to jump backwards.
     if ((handleBufferResult & AudioTrack.RESULT_POSITION_DISCONTINUITY) != 0) {
-      currentPositionUs = Long.MIN_VALUE;
+      handleAudioTrackDiscontinuity();
+      allowPositionDiscontinuity = true;
     }
 
     // Release the buffer if it was consumed.
@@ -271,17 +426,32 @@ public class MediaCodecAudioTrackRenderer extends MediaCodecTrackRenderer {
   }
 
   @Override
+  protected void onOutputStreamEnded() {
+    audioTrack.handleEndOfStream();
+  }
+
+  protected void handleAudioTrackDiscontinuity() {
+    // Do nothing
+  }
+
+  @Override
   public void handleMessage(int messageType, Object message) throws ExoPlaybackException {
-    if (messageType == MSG_SET_VOLUME) {
-      audioTrack.setVolume((Float) message);
-    } else {
-      super.handleMessage(messageType, message);
+    switch (messageType) {
+      case MSG_SET_VOLUME:
+        audioTrack.setVolume((Float) message);
+        break;
+      case MSG_SET_PLAYBACK_PARAMS:
+        audioTrack.setPlaybackParams((PlaybackParams) message);
+        break;
+      default:
+        super.handleMessage(messageType, message);
+        break;
     }
   }
 
   private void notifyAudioTrackInitializationError(final AudioTrack.InitializationException e) {
     if (eventHandler != null && eventListener != null) {
-      eventHandler.post(new Runnable()  {
+      eventHandler.post(new Runnable() {
         @Override
         public void run() {
           eventListener.onAudioTrackInitializationError(e);
@@ -296,6 +466,18 @@ public class MediaCodecAudioTrackRenderer extends MediaCodecTrackRenderer {
         @Override
         public void run() {
           eventListener.onAudioTrackWriteError(e);
+        }
+      });
+    }
+  }
+
+  private void notifyAudioTrackUnderrun(final int bufferSize, final long bufferSizeMs,
+      final long elapsedSinceLastFeedMs) {
+    if (eventHandler != null && eventListener != null) {
+      eventHandler.post(new Runnable()  {
+        @Override
+        public void run() {
+          eventListener.onAudioTrackUnderrun(bufferSize, bufferSizeMs, elapsedSinceLastFeedMs);
         }
       });
     }

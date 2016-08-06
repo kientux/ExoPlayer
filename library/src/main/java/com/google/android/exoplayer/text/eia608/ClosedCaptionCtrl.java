@@ -57,6 +57,8 @@ package com.google.android.exoplayer.text.eia608;
   public static final byte CARRIAGE_RETURN = 0x2D;
   public static final byte ERASE_NON_DISPLAYED_MEMORY = 0x2E;
 
+  public static final byte BACKSPACE = 0x21;
+
 
   public static final byte MID_ROW_CHAN_1 = 0x11;
   public static final byte MID_ROW_CHAN_2 = 0x19;
@@ -90,6 +92,10 @@ package com.google.android.exoplayer.text.eia608;
 
   public boolean isPreambleAddressCode() {
     return (cc1 >= 0x10 && cc1 <= 0x1F) && (cc2 >= 0x40 && cc2 <= 0x7F);
+  }
+
+  public boolean isRepeatable() {
+    return cc1 >= 0x10 && cc1 <= 0x1F;
   }
 
 }

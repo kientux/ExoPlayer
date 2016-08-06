@@ -17,8 +17,6 @@ package com.google.android.exoplayer.hls;
 
 import com.google.android.exoplayer.C;
 
-import android.net.Uri;
-
 import java.util.List;
 
 /**
@@ -30,24 +28,25 @@ public final class HlsMediaPlaylist extends HlsPlaylist {
    * Media segment reference.
    */
   public static final class Segment implements Comparable<Long> {
-    public final boolean discontinuity;
-    public final double durationSecs;
+
     public final String url;
+    public final double durationSecs;
+    public final int discontinuitySequenceNumber;
     public final long startTimeUs;
-    public final String encryptionMethod;
+    public final boolean isEncrypted;
     public final String encryptionKeyUri;
     public final String encryptionIV;
-    public final int byterangeOffset;
-    public final int byterangeLength;
+    public final long byterangeOffset;
+    public final long byterangeLength;
 
-    public Segment(String uri, double durationSecs, boolean discontinuity, long startTimeUs,
-        String encryptionMethod, String encryptionKeyUri, String encryptionIV,
-        int byterangeOffset, int byterangeLength) {
+    public Segment(String uri, double durationSecs, int discontinuitySequenceNumber,
+        long startTimeUs, boolean isEncrypted, String encryptionKeyUri, String encryptionIV,
+        long byterangeOffset, long byterangeLength) {
       this.url = uri;
       this.durationSecs = durationSecs;
-      this.discontinuity = discontinuity;
+      this.discontinuitySequenceNumber = discontinuitySequenceNumber;
       this.startTimeUs = startTimeUs;
-      this.encryptionMethod = encryptionMethod;
+      this.isEncrypted = isEncrypted;
       this.encryptionKeyUri = encryptionKeyUri;
       this.encryptionIV = encryptionIV;
       this.byterangeOffset = byterangeOffset;
@@ -70,7 +69,7 @@ public final class HlsMediaPlaylist extends HlsPlaylist {
   public final boolean live;
   public final long durationUs;
 
-  public HlsMediaPlaylist(Uri baseUri, int mediaSequence, int targetDurationSecs, int version,
+  public HlsMediaPlaylist(String baseUri, int mediaSequence, int targetDurationSecs, int version,
       boolean live, List<Segment> segments) {
     super(baseUri, HlsPlaylist.TYPE_MEDIA);
     this.mediaSequence = mediaSequence;

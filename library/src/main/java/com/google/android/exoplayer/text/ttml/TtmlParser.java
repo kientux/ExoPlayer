@@ -1,4 +1,4 @@
-/*
+/*arse
  * Copyright (C) 2014 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,19 +17,25 @@ package com.google.android.exoplayer.text.ttml;
 
 import com.google.android.exoplayer.C;
 import com.google.android.exoplayer.ParserException;
-import com.google.android.exoplayer.text.Subtitle;
+import com.google.android.exoplayer.text.Cue;
 import com.google.android.exoplayer.text.SubtitleParser;
 import com.google.android.exoplayer.util.MimeTypes;
+import com.google.android.exoplayer.util.ParserUtil;
+import com.google.android.exoplayer.util.Util;
 
+import android.text.Layout;
 import android.util.Log;
+import android.util.Pair;
 
 import org.xmlpull.v1.XmlPullParser;
 import org.xmlpull.v1.XmlPullParserException;
 import org.xmlpull.v1.XmlPullParserFactory;
 
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
-import java.io.InputStream;
+import java.util.HashMap;
 import java.util.LinkedList;
+import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -54,19 +60,24 @@ import java.util.regex.Pattern;
  * </p>
  * @see <a href="http://www.w3.org/TR/ttaf1-dfxp/">TTML specification</a>
  */
-public class TtmlParser implements SubtitleParser {
+public final class TtmlParser implements SubtitleParser {
 
   private static final String TAG = "TtmlParser";
 
   private static final String ATTR_BEGIN = "begin";
   private static final String ATTR_DURATION = "dur";
   private static final String ATTR_END = "end";
+  private static final String ATTR_STYLE = "style";
+  private static final String ATTR_REGION = "region";
 
   private static final Pattern CLOCK_TIME =
       Pattern.compile("^([0-9][0-9]+):([0-9][0-9]):([0-9][0-9])"
           + "(?:(\\.[0-9]+)|:([0-9][0-9])(?:\\.([0-9]+))?)?$");
   private static final Pattern OFFSET_TIME =
       Pattern.compile("^([0-9]+(?:\\.[0-9]+)?)(h|m|s|ms|f|t)$");
+  private static final Pattern FONT_SIZE = Pattern.compile("^(([0-9]*.)?[0-9]+)(px|em|%)$");
+  private static final Pattern PERCENTAGE_COORDINATES =
+      Pattern.compile("^(\\d+\\.?\\d*?)% (\\d+\\.?\\d*?)%$");
 
   // TODO: read and apply the following attributes if specified.
   private static final int DEFAULT_FRAMERATE = 30;
@@ -74,38 +85,32 @@ public class TtmlParser implements SubtitleParser {
   private static final int DEFAULT_TICKRATE = 1;
 
   private final XmlPullParserFactory xmlParserFactory;
-  private final boolean strictParsing;
 
-  /**
-   * Equivalent to {@code TtmlParser(true)}.
-   */
   public TtmlParser() {
-    this(true);
-  }
-
-  /**
-   * @param strictParsing If true, {@link #parse(InputStream, String, long)} will throw a
-   *     {@link ParserException} if the stream contains invalid ttml. If false, the parser will
-   *     make a best effort to ignore minor errors in the stream. Note however that a
-   *     {@link ParserException} will still be thrown when this is not possible.
-   */
-  public TtmlParser(boolean strictParsing) {
-    this.strictParsing = strictParsing;
     try {
       xmlParserFactory = XmlPullParserFactory.newInstance();
+      xmlParserFactory.setNamespaceAware(true);
     } catch (XmlPullParserException e) {
       throw new RuntimeException("Couldn't create XmlPullParserFactory instance", e);
     }
   }
 
   @Override
-  public Subtitle parse(InputStream inputStream, String inputEncoding, long startTimeUs)
-      throws IOException {
+  public boolean canParse(String mimeType) {
+    return MimeTypes.APPLICATION_TTML.equals(mimeType);
+  }
+
+  @Override
+  public TtmlSubtitle parse(byte[] bytes, int offset, int length) throws ParserException {
     try {
       XmlPullParser xmlParser = xmlParserFactory.newPullParser();
-      xmlParser.setInput(inputStream, inputEncoding);
+      Map<String, TtmlStyle> globalStyles = new HashMap<>();
+      Map<String, TtmlRegion> regionMap = new HashMap<>();
+      regionMap.put(TtmlNode.ANONYMOUS_REGION_ID, new TtmlRegion());
+      ByteArrayInputStream inputStream = new ByteArrayInputStream(bytes, offset, length);
+      xmlParser.setInput(inputStream, null);
       TtmlSubtitle ttmlSubtitle = null;
-      LinkedList<TtmlNode> nodeStack = new LinkedList<TtmlNode>();
+      LinkedList<TtmlNode> nodeStack = new LinkedList<>();
       int unsupportedNodeDepth = 0;
       int eventType = xmlParser.getEventType();
       while (eventType != XmlPullParser.END_DOCUMENT) {
@@ -116,28 +121,26 @@ public class TtmlParser implements SubtitleParser {
             if (!isSupportedTag(name)) {
               Log.i(TAG, "Ignoring unsupported tag: " + xmlParser.getName());
               unsupportedNodeDepth++;
+            } else if (TtmlNode.TAG_HEAD.equals(name)) {
+              parseHeader(xmlParser, globalStyles, regionMap);
             } else {
               try {
-                TtmlNode node = parseNode(xmlParser, parent);
+                TtmlNode node = parseNode(xmlParser, parent, regionMap);
                 nodeStack.addLast(node);
                 if (parent != null) {
                   parent.addChild(node);
                 }
               } catch (ParserException e) {
-                if (strictParsing) {
-                  throw e;
-                } else {
-                  Log.e(TAG, "Suppressing parser error", e);
-                  // Treat the node (and by extension, all of its children) as unsupported.
-                  unsupportedNodeDepth++;
-                }
+                Log.w(TAG, "Suppressing parser error", e);
+                // Treat the node (and by extension, all of its children) as unsupported.
+                unsupportedNodeDepth++;
               }
             }
           } else if (eventType == XmlPullParser.TEXT) {
             parent.addChild(TtmlNode.buildTextNode(xmlParser.getText()));
           } else if (eventType == XmlPullParser.END_TAG) {
             if (xmlParser.getName().equals(TtmlNode.TAG_TT)) {
-              ttmlSubtitle = new TtmlSubtitle(nodeStack.getLast(), startTimeUs);
+              ttmlSubtitle = new TtmlSubtitle(nodeStack.getLast(), globalStyles, regionMap);
             }
             nodeStack.removeLast();
           }
@@ -154,32 +157,203 @@ public class TtmlParser implements SubtitleParser {
       return ttmlSubtitle;
     } catch (XmlPullParserException xppe) {
       throw new ParserException("Unable to parse source", xppe);
+    } catch (IOException e) {
+      throw new IllegalStateException("Unexpected error when reading input.", e);
     }
   }
 
-  @Override
-  public boolean canParse(String mimeType) {
-    return MimeTypes.APPLICATION_TTML.equals(mimeType);
+  private Map<String, TtmlStyle> parseHeader(XmlPullParser xmlParser,
+      Map<String, TtmlStyle> globalStyles, Map<String, TtmlRegion> globalRegions)
+      throws IOException, XmlPullParserException {
+    do {
+      xmlParser.next();
+      if (ParserUtil.isStartTag(xmlParser, TtmlNode.TAG_STYLE)) {
+        String parentStyleId = ParserUtil.getAttributeValue(xmlParser, ATTR_STYLE);
+        TtmlStyle style = parseStyleAttributes(xmlParser, new TtmlStyle());
+        if (parentStyleId != null) {
+          String[] ids = parseStyleIds(parentStyleId);
+          for (int i = 0; i < ids.length; i++) {
+            style.chain(globalStyles.get(ids[i]));
+          }
+        }
+        if (style.getId() != null) {
+          globalStyles.put(style.getId(), style);
+        }
+      } else if (ParserUtil.isStartTag(xmlParser, TtmlNode.TAG_REGION)) {
+        Pair<String, TtmlRegion> ttmlRegionInfo = parseRegionAttributes(xmlParser);
+        if (ttmlRegionInfo != null) {
+          globalRegions.put(ttmlRegionInfo.first, ttmlRegionInfo.second);
+        }
+      }
+    } while (!ParserUtil.isEndTag(xmlParser, TtmlNode.TAG_HEAD));
+    return globalStyles;
   }
 
-  private TtmlNode parseNode(XmlPullParser parser, TtmlNode parent) throws ParserException {
+  /**
+   * Parses a region declaration. Supports origin and extent definition but only when defined in
+   * terms of percentage of the viewport. Regions that do not correctly declare origin are ignored.
+   */
+  private Pair<String, TtmlRegion> parseRegionAttributes(XmlPullParser xmlParser) {
+    String regionId = ParserUtil.getAttributeValue(xmlParser, TtmlNode.ATTR_ID);
+    String regionOrigin = ParserUtil.getAttributeValue(xmlParser, TtmlNode.ATTR_TTS_ORIGIN);
+    String regionExtent = ParserUtil.getAttributeValue(xmlParser, TtmlNode.ATTR_TTS_EXTENT);
+    if (regionOrigin == null || regionId == null) {
+      return null;
+    }
+    float position = Cue.DIMEN_UNSET;
+    float line = Cue.DIMEN_UNSET;
+    Matcher originMatcher = PERCENTAGE_COORDINATES.matcher(regionOrigin);
+    if (originMatcher.matches()) {
+      try {
+        position = Float.parseFloat(originMatcher.group(1)) / 100.f;
+        line = Float.parseFloat(originMatcher.group(2)) / 100.f;
+      } catch (NumberFormatException e) {
+        Log.w(TAG, "Ignoring region with malformed origin: '" + regionOrigin + "'", e);
+        position = Cue.DIMEN_UNSET;
+      }
+    }
+    float width = Cue.DIMEN_UNSET;
+    if (regionExtent != null) {
+      Matcher extentMatcher = PERCENTAGE_COORDINATES.matcher(regionExtent);
+      if (extentMatcher.matches()) {
+        try {
+          width = Float.parseFloat(extentMatcher.group(1)) / 100.f;
+        } catch (NumberFormatException e) {
+          Log.w(TAG, "Ignoring malformed region extent: '" + regionExtent + "'", e);
+        }
+      }
+    }
+    return position != Cue.DIMEN_UNSET ? new Pair<>(regionId, new TtmlRegion(position, line, width))
+        : null;
+  }
+
+  private String[] parseStyleIds(String parentStyleIds) {
+    return parentStyleIds.split("\\s+");
+  }
+
+  private TtmlStyle parseStyleAttributes(XmlPullParser parser, TtmlStyle style) {
+    int attributeCount = parser.getAttributeCount();
+    for (int i = 0; i < attributeCount; i++) {
+      String attributeValue = parser.getAttributeValue(i);
+      switch (parser.getAttributeName(i)) {
+        case TtmlNode.ATTR_ID:
+          if (TtmlNode.TAG_STYLE.equals(parser.getName())) {
+            style = createIfNull(style).setId(attributeValue);
+          }
+          break;
+        case TtmlNode.ATTR_TTS_BACKGROUND_COLOR:
+          style = createIfNull(style);
+          try {
+            style.setBackgroundColor(TtmlColorParser.parseColor(attributeValue));
+          } catch (IllegalArgumentException e) {
+            Log.w(TAG, "failed parsing background value: '" + attributeValue + "'");
+          }
+          break;
+        case TtmlNode.ATTR_TTS_COLOR:
+          style = createIfNull(style);
+          try {
+            style.setFontColor(TtmlColorParser.parseColor(attributeValue));
+          } catch (IllegalArgumentException e) {
+            Log.w(TAG, "failed parsing color value: '" + attributeValue + "'");
+          }
+          break;
+        case TtmlNode.ATTR_TTS_FONT_FAMILY:
+          style = createIfNull(style).setFontFamily(attributeValue);
+          break;
+        case TtmlNode.ATTR_TTS_FONT_SIZE:
+          try {
+            style = createIfNull(style);
+            parseFontSize(attributeValue, style);
+          } catch (ParserException e) {
+            Log.w(TAG, "failed parsing fontSize value: '" + attributeValue + "'");
+          }
+          break;
+        case TtmlNode.ATTR_TTS_FONT_WEIGHT:
+          style = createIfNull(style).setBold(
+              TtmlNode.BOLD.equalsIgnoreCase(attributeValue));
+          break;
+        case TtmlNode.ATTR_TTS_FONT_STYLE:
+          style = createIfNull(style).setItalic(
+              TtmlNode.ITALIC.equalsIgnoreCase(attributeValue));
+          break;
+        case TtmlNode.ATTR_TTS_TEXT_ALIGN:
+          switch (Util.toLowerInvariant(attributeValue)) {
+            case TtmlNode.LEFT:
+              style = createIfNull(style).setTextAlign(Layout.Alignment.ALIGN_NORMAL);
+              break;
+            case TtmlNode.START:
+              style = createIfNull(style).setTextAlign(Layout.Alignment.ALIGN_NORMAL);
+              break;
+            case TtmlNode.RIGHT:
+              style = createIfNull(style).setTextAlign(Layout.Alignment.ALIGN_OPPOSITE);
+              break;
+            case TtmlNode.END:
+              style = createIfNull(style).setTextAlign(Layout.Alignment.ALIGN_OPPOSITE);
+              break;
+            case TtmlNode.CENTER:
+              style = createIfNull(style).setTextAlign(Layout.Alignment.ALIGN_CENTER);
+              break;
+          }
+          break;
+        case TtmlNode.ATTR_TTS_TEXT_DECORATION:
+          switch (Util.toLowerInvariant(attributeValue)) {
+            case TtmlNode.LINETHROUGH:
+              style = createIfNull(style).setLinethrough(true);
+              break;
+            case TtmlNode.NO_LINETHROUGH:
+              style = createIfNull(style).setLinethrough(false);
+              break;
+            case TtmlNode.UNDERLINE:
+              style = createIfNull(style).setUnderline(true);
+              break;
+            case TtmlNode.NO_UNDERLINE:
+              style = createIfNull(style).setUnderline(false);
+              break;
+          }
+          break;
+        default:
+          // ignore
+          break;
+      }
+    }
+    return style;
+  }
+
+  private TtmlStyle createIfNull(TtmlStyle style) {
+    return style == null ? new TtmlStyle() : style;
+  }
+
+  private TtmlNode parseNode(XmlPullParser parser, TtmlNode parent,
+      Map<String, TtmlRegion> regionMap) throws ParserException {
     long duration = 0;
     long startTime = TtmlNode.UNDEFINED_TIME;
     long endTime = TtmlNode.UNDEFINED_TIME;
+    String regionId = TtmlNode.ANONYMOUS_REGION_ID;
+    String[] styleIds = null;
     int attributeCount = parser.getAttributeCount();
+    TtmlStyle style = parseStyleAttributes(parser, null);
     for (int i = 0; i < attributeCount; i++) {
-      // TODO: check if it's safe to ignore the namespace of attributes as follows.
-      String attr = parser.getAttributeName(i).replaceFirst("^.*:", "");
+      String attr = parser.getAttributeName(i);
       String value = parser.getAttributeValue(i);
-      if (attr.equals(ATTR_BEGIN)) {
+      if (ATTR_BEGIN.equals(attr)) {
         startTime = parseTimeExpression(value,
             DEFAULT_FRAMERATE, DEFAULT_SUBFRAMERATE, DEFAULT_TICKRATE);
-      } else if (attr.equals(ATTR_END)) {
+      } else if (ATTR_END.equals(attr)) {
         endTime = parseTimeExpression(value,
             DEFAULT_FRAMERATE, DEFAULT_SUBFRAMERATE, DEFAULT_TICKRATE);
-      } else if (attr.equals(ATTR_DURATION)) {
+      } else if (ATTR_DURATION.equals(attr)) {
         duration = parseTimeExpression(value,
             DEFAULT_FRAMERATE, DEFAULT_SUBFRAMERATE, DEFAULT_TICKRATE);
+      } else if (ATTR_STYLE.equals(attr)) {
+        // IDREFS: potentially multiple space delimited ids
+        String[] ids = parseStyleIds(value);
+        if (ids.length > 0) {
+          styleIds = ids;
+        }
+      } else if (ATTR_REGION.equals(attr) && regionMap.containsKey(value)) {
+        // If the region has not been correctly declared or does not define a position, we use the
+        // anonymous region.
+        regionId = value;
       } else {
         // Do nothing.
       }
@@ -201,7 +375,7 @@ public class TtmlParser implements SubtitleParser {
         endTime = parent.endTimeUs;
       }
     }
-    return TtmlNode.buildNode(parser.getName(), startTime, endTime);
+    return TtmlNode.buildNode(parser.getName(), startTime, endTime, style, styleIds, regionId);
   }
 
   private static boolean isSupportedTag(String tag) {
@@ -225,6 +399,41 @@ public class TtmlParser implements SubtitleParser {
     return false;
   }
 
+  private static void parseFontSize(String expression, TtmlStyle out) throws ParserException {
+    String[] expressions = expression.split("\\s+");
+    Matcher matcher;
+    if (expressions.length == 1) {
+      matcher = FONT_SIZE.matcher(expression);
+    } else if (expressions.length == 2){
+      matcher = FONT_SIZE.matcher(expressions[1]);
+      Log.w(TAG, "Multiple values in fontSize attribute. Picking the second value for vertical font"
+          + " size and ignoring the first.");
+    } else {
+      throw new ParserException("Invalid number of entries for fontSize: " + expressions.length
+          + ".");
+    }
+
+    if (matcher.matches()) {
+      String unit = matcher.group(3);
+      switch (unit) {
+        case "px":
+          out.setFontSizeUnit(TtmlStyle.FONT_SIZE_UNIT_PIXEL);
+          break;
+        case "em":
+          out.setFontSizeUnit(TtmlStyle.FONT_SIZE_UNIT_EM);
+          break;
+        case "%":
+          out.setFontSizeUnit(TtmlStyle.FONT_SIZE_UNIT_PERCENT);
+          break;
+        default:
+          throw new ParserException("Invalid unit for fontSize: '" + unit + "'.");
+      }
+      out.setFontSize(Float.valueOf(matcher.group(1)));
+    } else {
+      throw new ParserException("Invalid expression for fontSize: '" + expression + "'.");
+    }
+  }
+
   /**
    * Parses a time expression, returning the parsed timestamp.
    * <p>
@@ -232,8 +441,8 @@ public class TtmlParser implements SubtitleParser {
    * <a href="http://www.w3.org/TR/ttaf1-dfxp/#timing-value-timeExpression">timeExpression</a>
    *
    * @param time A string that includes the time expression.
-   * @param frameRate The framerate of the stream.
-   * @param subframeRate The sub-framerate of the stream
+   * @param frameRate The frame rate of the stream.
+   * @param subframeRate The sub-frame rate of the stream
    * @param tickRate The tick rate of the stream.
    * @return The parsed timestamp in microseconds.
    * @throws ParserException If the given string does not contain a valid time expression.
